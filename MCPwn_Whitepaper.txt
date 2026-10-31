@@ -1,0 +1,409 @@
+================================================================================
+  MCPwn: Offensive Security Framework for AI Agent Protocols
+================================================================================
+
+  Dr. Sapna V M
+  Associate Professor, Department of Computer Science
+  PES University, Bengaluru, India
+
+  Source: https://github.com/p17433308-cmyk/MCPwn
+
+--------------------------------------------------------------------------------
+ABSTRACT
+--------------------------------------------------------------------------------
+The Model Context Protocol (MCP) is the de facto standard for AI agent-tool
+communication, adopted by Claude, GPT, Cursor, Windsurf, and hundreds of
+thousands of deployed servers. MCP enables AI models to call tools, read
+resources, and execute prompts on remote servers via JSON-RPC 2.0 over HTTP+SSE
+or stdio transports. The protocol's rapid adoption has outpaced its security
+posture: 30 CVEs were published in 60 days during 2025-2026, over 200,000
+servers are exposed on the internet, and 36% of scanned servers have zero
+authentication.
+
+We present MCPwn, the first comprehensive offensive security framework for MCP.
+MCPwn implements full protocol clients for both transports (HTTP+SSE and stdio),
+a server scanner with multi-threaded network enumeration, an automated security
+auditor testing nine vulnerability classes (path traversal, command injection,
+SSRF, SQL injection, arbitrary file write, missing authentication, tool
+poisoning, sensitive data exposure, and prompt injection), five attack modules
+(tool poisoning detection, data exfiltration, resource URI injection, response
+injection, and privilege escalation), a known CVE database with server
+fingerprinting, forensic traffic capture with anomaly detection, and an
+intentionally vulnerable test server for demonstration.
+
+All components use real protocol communication — no simulation, no hardcoded
+results, no third-party dependencies required.
+
+--------------------------------------------------------------------------------
+1. INTRODUCTION
+--------------------------------------------------------------------------------
+The Model Context Protocol (MCP), released by Anthropic in late 2024, provides
+a standardized interface between AI models and external tools. An MCP server
+exposes tools (callable functions), resources (readable data), and prompts
+(parameterized templates) through a JSON-RPC 2.0 API. AI agents discover
+available capabilities through the initialize/list handshake and invoke them
+during conversations.
+
+The security implications are severe:
+  * MCP servers execute with the host system's privileges — a vulnerable tool
+    can read any file, execute any command, or access any network resource the
+    server process can reach.
+  * Tool descriptions are injected verbatim into the AI model's context as
+    trusted system text. A malicious description can manipulate the model into
+    performing unauthorized actions (tool poisoning).
+  * The default MCP SDK configuration has no authentication. Any client on the
+    network can connect, enumerate, and invoke tools.
+  * Many MCP servers expose file-reading, URL-fetching, and command-execution
+    tools without input validation, creating OWASP-standard web vulnerabilities
+    in the AI agent pipeline.
+
+The 2025-2026 CVE record includes:
+  * CVE-2026-27825: mcp-atlassian arbitrary file write + RCE (CVSS 9.8)
+  * CVE-2025-49596: MCP tool poisoning via prompt injection
+  * SSRF via MCP fetch/URL-reading tools (vulnerability class — multiple servers affected)
+  * POSTMARK-MCP-2025: First confirmed malicious MCP package on npm
+  * MCP-NO-AUTH-2025: 200,000+ servers exposed without authentication
+
+Contributions:
+  * Full MCP protocol clients for HTTP+SSE and stdio transports, implementing
+    the complete JSON-RPC 2.0 handshake, tool invocation, and resource reading.
+  * A multi-threaded server scanner for network-wide MCP server discovery,
+    port scanning, endpoint probing, and server fingerprinting.
+  * An automated security auditor testing nine vulnerability classes with
+    real payloads and evidence-based findings.
+  * Five attack modules exploiting common MCP server weaknesses.
+  * A CVE database with server fingerprinting for version-specific matching.
+  * Forensic traffic capture with three anomaly detectors.
+  * An intentionally vulnerable test server demonstrating all nine
+    vulnerability classes.
+
+--------------------------------------------------------------------------------
+2. BACKGROUND
+--------------------------------------------------------------------------------
+2.1 MCP Protocol
+MCP uses JSON-RPC 2.0 as its wire protocol. A session begins with:
+  1. Client sends "initialize" with protocolVersion, capabilities, clientInfo
+  2. Server responds with serverInfo, capabilities, protocolVersion
+  3. Client sends "notifications/initialized" notification
+  4. Client can now call "tools/list", "resources/list", "prompts/list"
+  5. Client invokes tools via "tools/call" with name and arguments
+  6. Client reads resources via "resources/read" with URI
+
+The current protocol version is 2025-03-26. Two transports are defined:
+  * HTTP+SSE (Streamable HTTP): POST JSON-RPC to /mcp endpoint, server
+    responds with JSON or SSE event stream
+  * stdio: Launch server as subprocess, send JSON-RPC lines on stdin, read
+    responses from stdout
+
+2.2 MCP Security Model
+The MCP specification does not mandate authentication. Server SDKs default to
+binding on localhost or 0.0.0.0 without any auth mechanism. Tool descriptions
+and resource metadata are treated as trusted content by AI models — there is
+no content security boundary between server-provided text and system prompts.
+
+2.3 Attack Surface
+  * Network: Unauthenticated access to tool invocation
+  * Input Validation: Tools pass user-controlled arguments to file operations,
+    shell commands, SQL queries, and URL fetches without sanitization
+  * AI Agent Manipulation: Tool descriptions are injected into model context,
+    enabling prompt injection through the tool metadata channel
+  * Supply Chain: Malicious MCP packages on npm/PyPI can exfiltrate host data
+
+2.4 Threat Model
+The attacker has network access to the MCP server endpoint (HTTP) or can
+install/configure MCP servers (stdio). For tool poisoning attacks, the attacker
+controls or has compromised an MCP server that the victim's AI agent connects
+to. For supply chain attacks, the attacker publishes a malicious MCP package.
+
+--------------------------------------------------------------------------------
+3. FRAMEWORK ARCHITECTURE
+--------------------------------------------------------------------------------
+MCPwn is organized into protocol client, reconnaissance, audit, attack,
+forensics, vulnerability database, and CLI:
+
+  mcpwn/
+    protocols/
+      mcp_client.py          JSON-RPC client (HTTP+SSE and stdio transports)
+    recon/
+      scanner.py             Port scanner, endpoint prober, server enumerator
+    audit/
+      security_auditor.py    Automated 9-class vulnerability scanner
+    attacks/
+      injector.py            5 attack modules with real payloads
+    forensics/
+      logger.py              Traffic capture, hashing, anomaly detection
+    vulndb/
+      known_cves.py          CVE database with fingerprinting
+    cli.py                   scan / audit / attack / cve / demo
+  test_server/
+    vuln_server.py           Intentionally vulnerable MCP server
+
+Dependencies: none required. Pure Python standard library with optional
+requests fallback.
+
+--------------------------------------------------------------------------------
+4. MCP PROTOCOL CLIENT
+--------------------------------------------------------------------------------
+4.1 HTTP+SSE Client (MCPClient)
+The HTTP+SSE client implements the full MCP handshake:
+  * _send_request() constructs JSON-RPC payloads and POSTs to /mcp
+  * Falls back to raw socket HTTP when the requests library is absent
+  * _parse_sse_response() handles Server-Sent Events response format
+  * initialize() performs the protocol handshake and extracts server info
+  * list_tools/list_resources/list_prompts enumerate server capabilities
+  * call_tool() invokes tools with arbitrary arguments
+  * read_resource() reads resources by URI
+  * full_enumerate() chains the complete discovery sequence
+
+4.2 stdio Client (MCPStdioClient)
+The stdio client launches MCP server subprocesses:
+  * Manages process lifecycle (start/stop)
+  * Sends JSON-RPC as newline-delimited JSON on stdin
+  * Reads responses from stdout
+  * Supports the same enumeration and invocation API
+
+4.3 Data Models
+All protocol objects are Python dataclasses with to_dict() serialization:
+  * MCPTool: name, description, inputSchema, annotations
+  * MCPResource: URI, name, description, MIME type
+  * MCPPrompt: name, description, arguments
+  * MCPServerInfo: aggregates all server metadata
+
+--------------------------------------------------------------------------------
+5. SERVER RECONNAISSANCE
+--------------------------------------------------------------------------------
+The MCPScanner provides multi-threaded MCP server discovery:
+
+5.1 Port Scanning
+Scans 11 common MCP ports (3000, 3001, 3333, 4000, 5000, 5001, 8000, 8080,
+8888, 9000, 9090) using TCP connect scanning with configurable timeout.
+
+5.2 Endpoint Probing
+For each open port, probes four known MCP endpoints (/mcp, /sse, /api/mcp,
+/v1/mcp) with initialize requests. Fingerprints the server by its JSON-RPC
+response pattern.
+
+5.3 Authentication Detection
+After successful enumeration, sends an unauthenticated tools/list request
+to determine if the server enforces access control. Servers returning tools
+without 401/403 are flagged.
+
+5.4 Network Scanning
+scan_network() scans entire /24 subnets using ThreadPoolExecutor with
+configurable parallelism. scan_urls() processes URL lists from files.
+
+5.5 Scan Results
+ScanResult aggregates: targets scanned, MCP servers found, total tools
+exposed, total resources exposed, servers without authentication, and scan
+duration.
+
+--------------------------------------------------------------------------------
+6. AUTOMATED SECURITY AUDIT
+--------------------------------------------------------------------------------
+The SecurityAuditor tests nine vulnerability classes:
+
+6.1 Missing Authentication (CWE-306)
+Detects servers that accept connections and tool invocations without any
+authentication mechanism. Maps to CVE MCP-NO-AUTH-2025 finding that 36% of
+deployed servers have zero auth.
+
+6.2 Path Traversal (CWE-22)
+Tests file-handling tools with 12 traversal payloads (../, URL-encoded, double-
+encoded, Windows, absolute paths). Detects success by checking for known file
+content indicators (/etc/passwd entries, .git/config patterns, .env variables).
+Also detects path disclosure in error messages.
+
+6.3 Command Injection (CWE-78)
+Tests execution tools with 15 injection payloads (;, |, $(), ``, &&, ||,
+newline injection, quote escape). Detects success by checking for command
+output indicators (uid=, MCPwn_RCE_TEST canary).
+
+6.4 Server-Side Request Forgery (CWE-918)
+Tests URL-fetching tools with 12 SSRF payloads targeting cloud metadata
+(AWS 169.254.169.254, GCP metadata.google.internal), localhost services
+(Redis, internal APIs), and protocol handlers (file://, gopher://, dict://).
+
+6.5 SQL Injection (CWE-89)
+Tests database tools with 8 SQLi payloads (OR-based, UNION-based, time-based,
+DROP). Detects success by checking for SQL error messages and syntax indicators.
+
+6.6 Arbitrary File Write (CWE-73)
+Tests write-capable tools for unrestricted path access by attempting writes
+to /tmp and traversal paths. Checks if path restrictions are enforced.
+
+6.7 Tool Poisoning / Prompt Injection (CWE-94)
+Scans tool descriptions for 8 prompt injection patterns: instruction override,
+role hijacking, system prompt injection, hidden instructions, behavior override,
+data exfiltration instructions, special token injection, and system block
+injection.
+
+6.8 Sensitive Data Exposure (CWE-200)
+Scans tool metadata for 10 regex patterns matching leaked credentials: API keys,
+secrets/tokens, passwords, AWS access keys, OpenAI keys, GitHub PATs, and
+database connection strings.
+
+6.9 Prompt Injection via Responses
+Tested through the attack module — see Section 7.4.
+
+6.10 Audit Reports
+AuditReport aggregates all findings with: severity classification (critical,
+high, medium, low, info), confidence level, CWE mapping, CVSS estimates,
+evidence, and remediation guidance. Exports to JSON.
+
+--------------------------------------------------------------------------------
+7. ATTACK MODULES
+--------------------------------------------------------------------------------
+7.1 Tool Poisoning Detection
+Analyzes tool descriptions, input schemas, and annotations for suspicious
+patterns: file reading references, command execution language, data sending
+instructions, override language, and zero-width Unicode characters (hidden
+text in descriptions).
+
+7.2 Data Exfiltration
+Identifies file-reading tools by name and description heuristics, then
+attempts to read 10 sensitive targets: /proc/self/environ, ~/.ssh/id_rsa,
+~/.aws/credentials, ~/.docker/config.json, ~/.kube/config, ~/.gitconfig,
+~/.bash_history, .env, ~/.npmrc, ~/.pypirc. Automatically maps tool input
+schemas to fill required parameters.
+
+7.3 Resource URI Injection
+Tests the resources/read endpoint with 6 malicious URIs: file:///etc/passwd,
+file:///proc/self/environ, path traversal, AWS metadata, Redis, and data: URIs.
+Also reads all declared resources to verify they do not require authentication.
+
+7.4 Response Injection
+Calls tools with 5 prompt injection payloads designed to manipulate AI agent
+behavior through tool responses: instruction override, maintenance mode claim,
+system role injection, tool result injection, and administrator impersonation.
+Detects success by checking if injection language is reflected in responses.
+
+7.5 Privilege Escalation
+Identifies dangerous tools (admin, delete, execute, shell, system, config,
+deploy, write, modify) and attempts to call them with minimal arguments.
+Detects whether the server enforces authorization for privileged operations.
+
+--------------------------------------------------------------------------------
+8. CVE DATABASE
+--------------------------------------------------------------------------------
+MCPwn includes a database of 8 real MCP CVEs and vulnerability patterns:
+
+  * CVE-2025-49596: Tool poisoning via prompt injection in descriptions
+  * CVE-2026-27825: mcp-atlassian arbitrary file write + RCE (CVSS 9.8)
+  * SSRF via MCP fetch/URL-reading tools (vulnerability class — multiple servers affected)
+  * MCP Sampling Abuse: Client security bypass via sampling requests
+  * POSTMARK-MCP-2025: First confirmed malicious MCP package
+  * MCP-NO-AUTH-2025: 200,000+ exposed servers without authentication
+  * Generic path traversal pattern
+  * Generic command injection pattern
+
+The match_server() function fingerprints servers by name and version,
+matching against known vulnerable configurations. get_patterns() returns
+the vulnerability pattern catalog for the auditor.
+
+--------------------------------------------------------------------------------
+9. FORENSIC TRAFFIC ANALYSIS
+--------------------------------------------------------------------------------
+The ForensicLog captures and analyzes MCP JSON-RPC traffic:
+
+9.1 Message Capture
+Each message is recorded with: timestamp, direction (request/response),
+JSON-RPC method, parameters, result, error, raw JSON, and SHA-256 hash
+for integrity verification.
+
+9.2 Anomaly Detection
+Three real-time anomaly detectors:
+  * Suspicious Tool Description: Detects manipulation language (ignore,
+    override, system, read_file, execute) and zero-width Unicode characters
+    in tool descriptions returned by tools/list
+  * Sensitive Data in Response: Detects credentials (password, secret, api_key,
+    token, SSH keys, AWS keys) in tool call responses
+  * Rate Anomaly: Detects more than 50 messages in 10 seconds, indicating
+    automated abuse or denial-of-service
+
+9.3 Export
+Exports forensic logs to JSON with message summaries, anomaly list, and
+method frequency analysis.
+
+--------------------------------------------------------------------------------
+10. VULNERABLE TEST SERVER
+--------------------------------------------------------------------------------
+MCPwn ships with an intentionally vulnerable MCP server (test_server/
+vuln_server.py) implementing every vulnerability class:
+
+  * read_file: No path sanitization (path traversal)
+  * write_file: No path restriction (arbitrary file write)
+  * run_command: shell=True with user input (command injection)
+  * fetch_url: No URL validation (SSRF)
+  * query_db: Direct SQL execution (SQL injection)
+  * search_users: String concatenation in SQL (SQL injection)
+  * get_config: Prompt injection in tool description + credential leak
+  * process_data: Zero-width Unicode hidden text in description
+  * resources/read: Handles file:// URIs without validation
+  * Server: Binds to 0.0.0.0 with zero authentication
+
+The demo command automatically starts this server, runs the full scan-audit-
+attack pipeline, and reports findings — demonstrating the complete offensive
+workflow against real network communication.
+
+--------------------------------------------------------------------------------
+11. EVALUATION
+--------------------------------------------------------------------------------
+We validated MCPwn with a test suite of 32 cases covering:
+  * MCP JSON-RPC client construction and SSE parsing (7 tests)
+  * Scanner dataclasses, configuration, and port lists (4 tests)
+  * Audit finding/report dataclasses and payload lists (3 tests)
+  * Attack result dataclasses, poison payloads, exfil targets (5 tests)
+  * CVE database content, fingerprint matching, pattern extraction (4 tests)
+  * Forensic logging, message hashing, anomaly detection (5 tests)
+  * Module exports — 30+ symbols across all sub-packages (2 tests)
+  * Vulnerable test server existence and module loading (2 tests)
+
+The demo command exercises the complete pipeline against the vulnerable test
+server: starts the server, probes it via MCP JSON-RPC, enumerates tools and
+resources, runs the full security audit (9 vulnerability classes), executes
+all attack modules, and produces a structured report — all using real network
+communication over HTTP.
+
+--------------------------------------------------------------------------------
+12. RESPONSIBLE USE
+--------------------------------------------------------------------------------
+MCPwn is intended for authorized security testing only: auditing your own
+MCP servers, authorized penetration testing engagements, and security
+research. The demo command uses only the included vulnerable test server
+running on localhost.
+
+The vulnerabilities MCPwn detects affect the entire AI agent ecosystem.
+As MCP adoption accelerates, the attack surface grows proportionally. Tools
+like MCPwn enable defenders to identify and remediate these vulnerabilities
+before adversaries exploit them in production AI deployments.
+
+--------------------------------------------------------------------------------
+13. CONCLUSION
+--------------------------------------------------------------------------------
+The Model Context Protocol has created a new attack surface at the intersection
+of web security and AI agent safety. Traditional OWASP vulnerabilities (path
+traversal, command injection, SSRF, SQL injection) are present in MCP servers
+because tools pass user-controlled arguments directly to dangerous system
+operations. Novel AI-specific vulnerabilities (tool poisoning, prompt injection
+via tool descriptions and responses) exploit the trust boundary between server-
+provided metadata and AI model context.
+
+MCPwn provides the first systematic offensive framework for this attack surface:
+full protocol clients, network-scale server discovery, automated nine-class
+vulnerability auditing, five attack modules with real payloads, a CVE database,
+and forensic traffic analysis. It enables security professionals to assess and
+harden the MCP infrastructure powering the next generation of AI agents.
+
+--------------------------------------------------------------------------------
+REFERENCES (SELECTED)
+--------------------------------------------------------------------------------
+  [1] Model Context Protocol Specification — https://spec.modelcontextprotocol.io
+  [2] JSON-RPC 2.0 Specification — https://www.jsonrpc.org/specification
+  [3] CVE-2026-27825 — mcp-atlassian arbitrary file write + RCE
+  [4] CVE-2025-49596 — MCP tool poisoning via prompt injection
+  [5] Invariant Labs — MCP Security: Tool Poisoning Attacks
+  [6] Palo Alto Unit 42 — MCP Security Risks
+  [7] OWASP Testing Guide v4 — Path Traversal, Command Injection, SSRF
+  [8] CWE-22, CWE-78, CWE-89, CWE-306, CWE-918 — Common Weakness Enumeration
+
+================================================================================
